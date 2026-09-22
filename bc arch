@@ -1,0 +1,1507 @@
+1. Final production-ready repository
+
+I would make the repository look like this:
+
+service/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   │
+│   ├── api/
+│   │   ├── router.py
+│   │   ├── dependencies.py
+│   │   ├── errors.py
+│   │   ├── middleware.py
+│   │   └── v1/
+│   │       ├── router.py
+│   │       └── events.py
+│   │
+│   ├── core/
+│   │   ├── config.py
+│   │   ├── logging.py
+│   │   ├── security.py
+│   │   ├── telemetry.py
+│   │   └── lifecycle.py
+│   │
+│   ├── domain/
+│   │   └── events/
+│   │       ├── entities.py
+│   │       ├── exceptions.py
+│   │       ├── services.py
+│   │       └── state.py
+│   │
+│   ├── application/
+│   │   ├── commands/
+│   │   ├── queries/
+│   │   └── services/
+│   │
+│   ├── infrastructure/
+│   │   ├── database/
+│   │   │   ├── base.py
+│   │   │   ├── session.py
+│   │   │   └── models/
+│   │   ├── repositories/
+│   │   └── messaging/
+│   │
+│   ├── schemas/
+│   │   ├── common.py
+│   │   └── events.py
+│   │
+│   └── health/
+│       ├── live.py
+│       └── ready.py
+│
+├── migrations/
+│   ├── versions/
+│   └── env.py
+│
+├── tests/
+│   ├── unit/
+│   ├── integration/
+│   ├── api/
+│   ├── contract/
+│   ├── e2e/
+│   ├── performance/
+│   └── fixtures/
+│
+├── scripts/
+│   ├── smoke_test.py
+│   ├── wait_for_db.py
+│   └── seed.py
+│
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── DECISIONS.md
+│   ├── API.md
+│   ├── TESTING.md
+│   ├── DEPLOYMENT.md
+│   ├── OPERATIONS.md
+│   ├── SECURITY.md
+│   ├── ASSUMPTIONS.md
+│   ├── TRADEOFFS.md
+│   ├── KNOWN_LIMITATIONS.md
+│   ├── SCALING.md
+│   ├── OBSERVABILITY.md
+│   ├── FAILURE_MODES.md
+│   ├── RUNBOOK.md
+│   └── REVIEW_NOTES.md
+│
+├── presentation/
+│   ├── ARCHITECTURE_REVIEW.md
+│   ├── DEMO_SCRIPT.md
+│   └── BEHAVIORAL_STAR_NOTES.md
+│
+├── .do/
+│   └── app.yaml
+│
+├── .github/
+│   └── workflows/
+│       ├── ci.yml
+│       └── security.yml
+│
+├── openapi/
+│   └── openapi.yaml
+│
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── pyproject.toml
+├── alembic.ini
+├── .env.example
+├── .dockerignore
+├── .gitignore
+├── README.md
+├── CHANGELOG.md
+└── LICENSE
+
+That looks like a repository a team could actually maintain.
+
+2. Architecture
+
+For an ingestion challenge, start with the simplest production-capable architecture:
+
+                        Internet
+                           │
+                           ▼
+                ┌─────────────────────┐
+                │ DigitalOcean        │
+                │ App Platform        │
+                │ ingress / TLS       │
+                └──────────┬──────────┘
+                           │
+                           ▼
+               ┌───────────────────────┐
+               │ FastAPI API Service   │
+               │                       │
+               │ request ID            │
+               │ validation            │
+               │ idempotency           │
+               │ domain processing     │
+               │ error handling        │
+               │ structured logging    │
+               │ metrics               │
+               └───────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │ PostgreSQL           │
+                │                      │
+                │ transactional data   │
+                │ constraints          │
+                │ indexes              │
+                │ idempotency          │
+                └──────────────────────┘
+
+And explicitly show the evolution path:
+
+VERSION 1
+
+API
+ │
+ ├── processing
+ │
+ └── PostgreSQL
+
+
+HIGHER SCALE
+
+API
+ │
+ ├── PostgreSQL
+ │
+ └── durable queue
+        │
+        ▼
+   Worker Fleet
+        │
+        ▼
+   PostgreSQL / storage
+
+That tells reviewers:
+
+I understand asynchronous architecture, but I'm not adding infrastructure until the workload requires it.
+
+That is stronger than blindly using Redis/Celery/Kafka.
+
+3. Python stack
+
+My default stack would be:
+
+Concern	Choice
+API	FastAPI
+Validation	Pydantic v2
+Server	Uvicorn
+Database	PostgreSQL
+ORM	SQLAlchemy 2.x
+Migrations	Alembic
+Testing	pytest
+Async HTTP tests	httpx
+DB integration	testcontainers or Docker Compose
+Formatting	Ruff
+Lint	Ruff
+Types	mypy or pyright
+Coverage	pytest-cov
+Logging	Python logging + JSON formatter / structlog
+Metrics	Prometheus client
+Tracing	OpenTelemetry
+Packaging	pyproject.toml
+Container	Docker
+CI	GitHub Actions
+Deployment	DigitalOcean App Platform
+
+Don't throw Celery, Redis, Kafka, Kubernetes, Elasticsearch, etc. into the first version unless the challenge warrants them.
+
+4. API contract
+
+For example:
+
+POST /v1/events
+GET  /v1/events/{event_id}
+GET  /v1/events
+GET  /health/live
+GET  /health/ready
+GET  /metrics
+
+A production ingestion request might look like:
+
+POST /v1/events
+Content-Type: application/json
+Idempotency-Key: f42ea9ce-dae1-4d2c-a877-cc703d52c71f
+{
+  "source": "example",
+  "type": "user.created",
+  "timestamp": "2026-09-22T10:30:00Z",
+  "payload": {
+    "user_id": "usr_123"
+  }
+}
+
+Response:
+
+{
+  "id": "evt_01K...",
+  "status": "processed",
+  "created_at": "2026-09-22T10:30:01Z"
+}
+
+Errors should use one shape everywhere:
+
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed.",
+    "details": [
+      {
+        "field": "timestamp",
+        "reason": "invalid RFC3339 timestamp"
+      }
+    ],
+    "request_id": "req_01K..."
+  }
+}
+5. Strong validation
+
+Don't accept arbitrary JSON without boundaries.
+
+Pydantic should enforce:
+
+maximum string lengths
+allowed event types
+timestamp format
+payload shape
+maximum payload size
+required fields
+forbidden extra fields where appropriate
+
+Example:
+
+class EventCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str = Field(min_length=1, max_length=100)
+    type: str = Field(min_length=1, max_length=100)
+    timestamp: datetime
+    payload: dict[str, Any]
+
+At the HTTP layer also impose a request-body size limit.
+
+6. Idempotency
+
+This is an excellent production-readiness feature for an ingestion service.
+
+Request
+   │
+   ▼
+Idempotency-Key
+   │
+   ▼
+lookup
+   │
+   ├── exists ─────→ return previous result
+   │
+   └── absent
+        │
+        ▼
+      process
+        │
+        ▼
+persist key + result atomically
+
+The database should enforce uniqueness.
+
+UNIQUE(idempotency_key)
+
+This prevents duplicate processing caused by client retries.
+
+7. Database design
+
+Example:
+
+events
+
+id                 UUID PK
+idempotency_key    VARCHAR UNIQUE
+source             VARCHAR NOT NULL
+event_type         VARCHAR NOT NULL
+payload            JSONB NOT NULL
+status             VARCHAR NOT NULL
+error_code         VARCHAR NULL
+created_at         TIMESTAMPTZ NOT NULL
+updated_at         TIMESTAMPTZ NOT NULL
+processed_at       TIMESTAMPTZ NULL
+
+Possible indexes:
+
+(status)
+(created_at DESC)
+(source, created_at DESC)
+(event_type, created_at DESC)
+
+Don't over-index.
+
+Explain why each index exists.
+
+8. Database migrations
+
+Use Alembic.
+
+The deployment process becomes:
+
+new image
+   ↓
+migration check
+   ↓
+apply backward-compatible migration
+   ↓
+start application
+   ↓
+readiness succeeds
+   ↓
+traffic enabled
+
+For larger systems, document:
+
+expand
+→ migrate/backfill
+→ application change
+→ contract
+
+instead of destructive migrations.
+
+9. Health model
+
+Use separate probes.
+
+GET /health/live
+
+Means:
+
+process is alive
+event loop works
+
+Don't check PostgreSQL here.
+
+Then:
+
+GET /health/ready
+
+Means:
+
+application initialized
+database reachable
+required dependencies available
+
+DigitalOcean App Platform supports configurable health checks and also liveness checks; failing readiness-style checks can stop traffic while liveness failures can restart components.
+
+That maps beautifully to:
+
+/health/ready
+/health/live
+10. Graceful shutdown
+
+Make this explicit.
+
+SIGTERM
+  ↓
+readiness false
+  ↓
+stop accepting new work
+  ↓
+complete active requests
+  ↓
+close DB pool
+  ↓
+flush telemetry
+  ↓
+exit
+
+Reviewers notice this.
+
+11. Timeouts
+
+Never let operations wait forever.
+
+Define:
+
+HTTP request timeout
+DB connection timeout
+DB query timeout
+external HTTP timeout
+shutdown timeout
+
+Configuration:
+
+REQUEST_TIMEOUT_SECONDS=10
+DATABASE_CONNECT_TIMEOUT_SECONDS=5
+SHUTDOWN_TIMEOUT_SECONDS=20
+12. Logging
+
+Use structured JSON.
+
+Example:
+
+{
+  "timestamp": "2026-09-22T10:40:13.938Z",
+  "level": "INFO",
+  "service": "event-ingestion-api",
+  "environment": "production",
+  "request_id": "req_123",
+  "method": "POST",
+  "route": "/v1/events",
+  "status_code": 201,
+  "duration_ms": 37
+}
+
+Never log:
+
+passwords
+access tokens
+database URLs
+secret keys
+raw sensitive payloads
+13. Correlation IDs
+
+Every incoming request gets:
+
+X-Request-ID
+
+If the client supplies a valid one, preserve it.
+
+Otherwise generate one.
+
+Return it in the response.
+
+Now:
+
+API response
+logs
+errors
+metrics exemplars
+traces
+
+can all point to the same request.
+
+14. Metrics
+
+Minimum:
+
+http_requests_total
+http_request_duration_seconds
+http_requests_in_progress
+
+events_received_total
+events_processed_total
+events_failed_total
+event_processing_duration_seconds
+
+db_query_duration_seconds
+db_pool_connections
+15. Tracing
+
+Use OpenTelemetry boundaries around:
+
+HTTP request
+ ↓
+validation
+ ↓
+service
+ ↓
+repository
+ ↓
+PostgreSQL
+
+If you later add a queue:
+
+HTTP trace
+    ↓
+producer
+    ↓
+message trace context
+    ↓
+worker
+16. Security
+
+For a 3-hour service I would target strong fundamentals:
+
+strict schema validation
+body size limits
+parameterized SQL / ORM
+safe error responses
+secret management
+dependency scanning
+non-root Docker user
+minimal base image
+CORS disabled unless required
+trusted host config
+TLS at platform edge
+rate-limiting strategy documented
+authentication explicitly decided
+
+Very important:
+
+If requirements don't require authentication, don't randomly implement JWT authentication.
+
+Document:
+
+Authentication was intentionally excluded because the
+exercise does not define users, identities, or authorization
+requirements.
+
+In a public production deployment I would add...
+
+That demonstrates judgment.
+
+17. Docker
+
+Use a multi-stage or otherwise minimal production Dockerfile.
+
+Conceptually:
+
+python:slim
+ ↓
+install dependencies
+ ↓
+copy app
+ ↓
+create non-root user
+ ↓
+run as non-root
+ ↓
+uvicorn
+
+Do not use:
+
+--reload
+
+in production.
+
+And don't run the development server.
+
+18. Local development
+
+docker-compose.yml:
+
+API
+PostgreSQL
+
+Maybe:
+
+OpenTelemetry collector
+
+only if you actually have time.
+
+Startup:
+
+make dev
+
+Tests:
+
+make test
+
+Lint:
+
+make lint
+
+Everything:
+
+make verify
+
+This is presentation-friendly because you aren't fumbling for commands.
+
+19. Makefile
+
+Give reviewers a tiny interface.
+
+make install
+make dev
+make test
+make test-integration
+make lint
+make typecheck
+make format
+make migrate
+make build
+make smoke
+make verify
+
+make verify should ideally run:
+
+format check
+lint
+type check
+unit tests
+integration tests
+20. CI pipeline
+
+I'd use:
+
+Push / PR
+    ↓
+Ruff format check
+    ↓
+Ruff lint
+    ↓
+type checking
+    ↓
+unit tests
+    ↓
+PostgreSQL integration tests
+    ↓
+coverage
+    ↓
+Alembic migration check
+    ↓
+Docker build
+    ↓
+dependency/security scan
+
+If time permits:
+
+OpenAPI consistency check
+21. Testing hierarchy
+
+Your project should visibly contain:
+
+tests/unit/
+tests/api/
+tests/integration/
+tests/contract/
+tests/e2e/
+
+Even if not every directory contains dozens of tests.
+
+Unit
+
+Test:
+
+validation
+business rules
+state transitions
+processing
+error mapping
+API
+
+Test:
+
+201 success
+400 malformed JSON
+422 semantic validation
+404 unknown event
+duplicate idempotency key
+large payload
+Integration
+
+Run against actual PostgreSQL.
+
+Test:
+
+insert
+read
+transactions
+unique constraints
+migrations
+Contract
+
+Validate response bodies against OpenAPI.
+
+E2E
+
+Run a deployed-like stack:
+
+POST event
+ ↓
+GET event
+ ↓
+verify persistence
+22. Failure testing
+
+Add scenarios most candidates forget.
+
+database unavailable
+duplicate request
+malformed payload
+timeout
+shutdown while processing
+repository exception
+unexpected application exception
+
+Then ensure behavior remains predictable.
+
+23. Smoke test
+
+scripts/smoke_test.py
+
+After deployment:
+
+check /health/live
+check /health/ready
+POST valid event
+GET created event
+POST invalid event
+verify expected validation error
+
+One command:
+
+python scripts/smoke_test.py https://your-app.example
+
+This looks excellent during the review.
+
+24. DigitalOcean deployment
+
+I'd include:
+
+.do/app.yaml
+
+App Platform can use a YAML app specification to configure components, health checks, environment configuration, deployments, jobs and workers.
+
+Your architecture becomes:
+
+GitHub
+  │
+  ▼
+GitHub Actions
+  │
+  ▼
+Docker image
+  │
+  ▼
+DigitalOcean App Platform
+  │
+  ├── API service
+  │
+  └── Managed PostgreSQL
+
+DigitalOcean also supports deploying App Platform components directly from supported container registries, including DigitalOcean Container Registry, Docker Hub, and GHCR.
+
+For a three-hour exercise, I'd prefer:
+
+GitHub repo
+    ↓
+App Platform build/deployment
+
+unless the challenge specifically rewards container-registry work.
+
+25. Add your requested documentation
+
+Now I would make your requested documents mandatory for this interview template.
+
+README.md
+
+Highest priority.
+
+Structure:
+
+# Service Name
+
+## Overview
+
+## Features
+
+## Architecture
+
+## Tech Stack
+
+## Quick Start
+
+## Configuration
+
+## Database
+
+## API
+
+## Testing
+
+## Observability
+
+## Security
+
+## Deployment
+
+## Design Decisions
+
+## Assumptions
+
+## Known Limitations
+
+## Scaling Strategy
+
+## Improvements With More Time
+
+The README should let an engineer understand and run the project without asking you anything.
+
+26. ARCHITECTURE.md
+
+Use:
+
+1. Problem/context
+
+2. Requirements
+
+3. Quality attributes
+
+4. Architecture overview
+
+5. Request/data flow
+
+6. Components
+
+7. Domain model
+
+8. Persistence
+
+9. Processing model
+
+10. Sync vs async decision
+
+11. Idempotency
+
+12. Error handling
+
+13. Failure model
+
+14. Observability
+
+15. Security
+
+16. Deployment
+
+17. Scaling
+
+18. Trade-offs
+
+19. Evolution path
+
+Include ASCII diagrams.
+
+That document becomes your architecture-review cheat sheet.
+
+27. DECISIONS.md
+
+I would use lightweight ADR entries.
+
+ADR-001 — FastAPI
+
+Decision:
+Use FastAPI for the HTTP service.
+
+Why:
+Strong Python typing integration, OpenAPI generation,
+Pydantic validation, low setup overhead.
+
+Alternatives:
+Flask, Django REST Framework.
+
+Trade-offs:
+FastAPI introduces async concepts and Pydantic coupling,
+but is a strong match for a small typed API.
+
+At larger scale:
+Framework choice would remain less important than service
+boundaries, runtime behavior and data architecture.
+
+Other likely ADRs:
+
+ADR-002 PostgreSQL
+ADR-003 SQLAlchemy
+ADR-004 synchronous processing
+ADR-005 idempotency strategy
+ADR-006 error contract
+ADR-007 Docker deployment
+ADR-008 observability strategy
+28. API.md + OpenAPI
+
+FastAPI gives you Swagger automatically:
+
+/docs
+
+and:
+
+/openapi.json
+
+But also commit a generated snapshot if time permits:
+
+openapi/openapi.yaml
+
+Document examples for:
+
+POST /v1/events
+GET /v1/events/{id}
+GET /health/live
+GET /health/ready
+29. TESTING.md
+
+Structure:
+
+Testing Philosophy
+
+Test Pyramid
+
+Unit Tests
+
+API Tests
+
+Integration Tests
+
+Contract Tests
+
+E2E Tests
+
+Failure Cases
+
+Coverage
+
+How to Run
+
+What Was Not Tested
+
+Future Testing
+
+Especially useful:
+
+What Was Not Tested
+
+It lets you explain conscious prioritization.
+
+30. DEPLOYMENT.md
+
+Include:
+
+Prerequisites
+
+Local Docker Build
+
+DigitalOcean Architecture
+
+Environment Variables
+
+Database Setup
+
+Migrations
+
+App Platform Deployment
+
+Health Verification
+
+Smoke Test
+
+Logs
+
+Rollback
+
+Troubleshooting
+
+DigitalOcean App Platform can automatically redeploy connected repositories and can deploy services from source or images.
+
+31. .env.example
+
+I'd use:
+
+APP_NAME=event-ingestion-service
+ENVIRONMENT=development
+LOG_LEVEL=INFO
+
+HOST=0.0.0.0
+PORT=8080
+
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/events
+DATABASE_POOL_SIZE=10
+DATABASE_MAX_OVERFLOW=10
+
+REQUEST_TIMEOUT_SECONDS=10
+MAX_REQUEST_BODY_BYTES=1048576
+
+OTEL_ENABLED=false
+OTEL_SERVICE_NAME=event-ingestion-service
+OTEL_EXPORTER_OTLP_ENDPOINT=
+
+CORS_ORIGINS=
+
+No real credentials.
+
+32. OPERATIONS.md
+
+Add:
+
+Service overview
+
+Dependencies
+
+Health model
+
+Metrics
+
+Logging
+
+Tracing
+
+Dashboards
+
+Alerts
+
+SLOs
+
+Capacity
+
+Scaling
+
+Common failures
+
+Operational procedures
+
+This moves the project from “backend code” toward “operable service.”
+
+33. RUNBOOK.md
+
+Example:
+
+# Database unavailable
+
+Symptoms:
+- /health/ready returns 503
+- elevated database connection errors
+
+Check:
+1. database status
+2. connection configuration
+3. connection pool exhaustion
+4. recent deployment
+
+Mitigation:
+1. stop traffic if necessary
+2. restore database connectivity
+3. rollback recent app change if correlated
+
+Verification:
+- /health/ready returns 200
+- error rate normalizes
+
+Have runbooks for:
+
+elevated 5xx
+high latency
+database unavailable
+deployment failure
+bad migration
+34. FAILURE_MODES.md
+
+This is a particularly strong architecture-review artifact.
+
+Use a table:
+
+Failure	Behavior	Detection	Recovery
+Invalid payload	422	API metric	client correction
+DB unavailable	503/readiness fails	logs + health	reconnect
+Duplicate request	existing result	metric	none
+Internal exception	500 + request ID	error logs	investigate
+Timeout	bounded failure	latency metric	retry where safe
+
+Now you can discuss system behavior instead of only happy-path architecture.
+
+35. TRADEOFFS.md
+
+Your proposed examples belong here.
+
+I'd make this especially good.
+
+## Synchronous processing
+
+Chosen because:
+- processing is lightweight
+- lower operational complexity
+- easier to complete safely within timebox
+
+Not chosen:
+- Celery/Redis
+- Kafka
+- dedicated workers
+
+When I would change:
+- long processing duration
+- independent scaling requirements
+- retry durability
+- burst absorption
+
+Then:
+
+PostgreSQL vs SQLite
+
+FastAPI vs Flask
+
+ORM vs raw SQL
+
+App Platform vs Droplet/Kubernetes
+
+managed database vs self-hosted
+36. ASSUMPTIONS.md
+
+Record assumptions before coding.
+
+Example:
+
+Payloads are smaller than 1 MB.
+
+Processing completes within normal HTTP latency.
+
+Ordering across events is not required.
+
+Event submission is expected to be retried by clients.
+
+Authentication is outside the supplied problem statement.
+
+PostgreSQL is available as a managed dependency.
+
+These become talking points.
+
+37. KNOWN_LIMITATIONS.md
+
+Include things like:
+
+No authentication because user/identity requirements were not supplied.
+
+No distributed rate limiter.
+
+No durable queue because processing is synchronous.
+
+No multi-region failover.
+
+Performance validated only at development-scale load.
+
+No production alerting integration configured during timebox.
+
+Don't hide these.
+
+Explain them.
+
+38. SCALING.md
+
+Show evolution.
+
+Stage 1
+
+one API replica
+PostgreSQL
+
+Stage 2
+
+multiple stateless API replicas
+managed PostgreSQL
+
+Stage 3
+
+API
+ ↓
+queue
+ ↓
+worker fleet
+
+Stage 4
+
+partition workload
+read replicas
+cache only where measurable
+object storage for large payloads
+
+Then describe bottlenecks before technologies.
+
+That sounds much more mature.
+
+39. OBSERVABILITY.md
+
+Document:
+
+Logs
+
+Metrics
+
+Traces
+
+Request correlation
+
+Health checks
+
+Suggested dashboard
+
+Suggested alerts
+
+SLOs
+
+Example SLO:
+
+API availability:
+99.9%
+
+POST ingestion:
+p95 < 250 ms
+
+Validation errors:
+excluded from service-error SLO
+
+Unexpected 5xx:
+< 0.1%
+40. Presentation package
+
+This is where I would go beyond your current list.
+
+Create:
+
+presentation/
+    ARCHITECTURE_REVIEW.md
+    DEMO_SCRIPT.md
+    BEHAVIORAL_STAR_NOTES.md
+41. ARCHITECTURE_REVIEW.md
+
+This is your 45-minute discussion guide.
+
+First section:
+
+30-second summary
+
+For example:
+
+I built a stateless FastAPI service backed by PostgreSQL. The HTTP boundary validates inputs and enforces a consistent error contract, the application layer contains processing behavior, and persistence is isolated behind a repository boundary. I chose synchronous processing because the workload did not justify queue infrastructure, but the architecture leaves a clear path to worker-based asynchronous processing. The service is containerized, tested at multiple levels, instrumented for operations, and deployed to DigitalOcean with explicit readiness and liveness behavior.
+
+Then:
+
+2-minute architecture walkthrough
+
+Then:
+
+major decisions
+
+Then:
+
+trade-offs
+
+Then:
+
+what I deliberately did NOT build
+
+Then:
+
+how I would scale it
+
+Then:
+
+how I would operate it
+
+That keeps the review structured.
+
+42. Presentation diagram
+
+I would show this:
+
+                 ┌──────────────┐
+                 │    Client    │
+                 └──────┬───────┘
+                        │ HTTPS
+                        ▼
+            ┌───────────────────────┐
+            │ DigitalOcean         │
+            │ App Platform         │
+            └──────────┬────────────┘
+                       │
+                       ▼
+            ┌───────────────────────┐
+            │ FastAPI              │
+            │                       │
+            │ middleware            │
+            │ validation            │
+            │ application services  │
+            │ domain logic          │
+            │ repository            │
+            └───────────┬───────────┘
+                        │
+                        ▼
+            ┌───────────────────────┐
+            │ Managed PostgreSQL    │
+            └───────────────────────┘
+
+        ┌──────────────────────────────┐
+        │ Operational plane           │
+        │ logs · metrics · traces     │
+        │ health · request IDs        │
+        └──────────────────────────────┘
+
+Then next slide/document section:
+
+Future scale:
+
+API → Queue → Workers → Database
+43. DEMO_SCRIPT.md
+
+A rehearsed demo prevents wasted interview time.
+
+Use:
+
+1. Show README
+2. Show architecture
+3. Start app
+4. Open Swagger
+5. Submit valid request
+6. Fetch persisted result
+7. Submit invalid request
+8. Demonstrate idempotency
+9. Run tests
+10. Show CI
+11. Open production deployment
+12. Run smoke test
+13. Show logs/health endpoints
+
+Try not to randomly browse files.
+
+Tell a story.
+
+44. Behavioral preparation
+
+Your suggested STAR document is good.
+
+I would make:
+
+presentation/BEHAVIORAL_STAR_NOTES.md
+
+with eight concise stories:
+
+1. Serious technical problem
+2. Production incident
+3. Disagreement/conflict
+4. Requirements changed
+5. Mistake/failure
+6. Process improvement
+7. Ambiguous project
+8. Severe deadline/time pressure
+
+Use:
+
+Situation
+
+Task
+
+Action
+
+Result
+
+Reflection
+
+Keep Action the longest section.
+
+Don't turn these into scripts that sound memorized.
+
+Use bullet triggers.
+
+45. Add a REVIEW_NOTES.md
+
+This is another file I'd add specifically for the interview.
+
+What I prioritized
+
+What I intentionally skipped
+
+Biggest technical risk
+
+Biggest production risk
+
+Biggest assumption
+
+Most important architectural decision
+
+What breaks first at 10× traffic
+
+What I would do with one more day
+
+What I would do with one more month
+
+How I would migrate to async processing
+
+During the review, almost every question maps to this file.
+
+46. Production quality gate
+
+Before you consider the project complete, run a checklist.
+
+[ ] service starts from clean checkout
+[ ] database migrations work
+[ ] tests pass
+[ ] linter passes
+[ ] type checker passes
+[ ] Docker image builds
+[ ] container runs as non-root
+[ ] no secrets committed
+[ ] .env.example complete
+[ ] malformed input handled
+[ ] database errors handled
+[ ] duplicate submissions handled
+[ ] request IDs work
+[ ] structured logs work
+[ ] readiness endpoint works
+[ ] liveness endpoint works
+[ ] OpenAPI works
+[ ] production deployment succeeds
+[ ] smoke test succeeds against production URL
+[ ] README instructions verified
+[ ] trade-offs documented
+[ ] known limitations documented
+[ ] architecture review notes ready
+
+This is what I'd use as the final gate.
+
+47. What to prioritize during the actual 3 hours
+
+You cannot build every production feature.
+
+I would prioritize in this order:
+
+Correct API + data model
+Clear architecture boundaries
+PostgreSQL persistence + migrations
+Validation + predictable errors
+Strong tests
+Docker
+DigitalOcean deployment
+health/readiness
+structured logs + request IDs
+README + architecture decisions
+idempotency
+CI
+metrics/tracing only if time remains
+
+I'd rather present a completely working, deployed system with disciplined decisions than a half-finished “enterprise architecture.”
+
+48. What makes this presentation-ready
+
+Your reviewer should immediately be able to see:
+
+Requirements
+      ↓
+Architecture decision
+      ↓
+Implementation
+      ↓
+Tests
+      ↓
+Deployment
+      ↓
+Production verification
+
+And when asked:
+
+Why did you do this?
+
+you shouldn't answer:
+
+That's how FastAPI projects usually do it.
+
+You should answer:
+
+Requirement
+      +
+Constraint
+      +
+Alternatives
+      +
+Trade-off
+      =
+Decision
+
+For example:
+
+I kept processing synchronous because the workload described in the challenge didn't establish a need for durable asynchronous execution. That reduced operational dependencies and allowed me to invest the time in data correctness, automated tests, observability, and deployment. If processing latency or burst volume exceeded the API's latency budget, the next step would be to separate acceptance from processing using a durable queue and worker fleet.
